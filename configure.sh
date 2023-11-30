@@ -174,7 +174,7 @@ for config in Release Debug; do
 
    build_dir=build/$platform$build_name_suffix
    mkdir -p $build_dir
-   (cd $build_dir; cmake -DCMAKE_BUILD_TYPE:STRING=$config -DVORPALINE_PLATFORM:STRING=$os $cmake_options ../../)
+   (cd $build_dir; cmake -DGEOGRAM_SUB_BUILD=ON -DCMAKE_BUILD_TYPE:STRING=$config -DVORPALINE_PLATFORM:STRING=$os $cmake_options ../../)
 done
 
 echo
