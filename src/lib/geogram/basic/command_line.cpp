@@ -1242,6 +1242,9 @@ namespace GEO {
             size_t max_L =
                 sub(ui_terminal_width(), 43 + ui_left_margin + ui_right_margin);
 
+            max_L -= size_t(std::log10(std::max(double(val),1.0)));
+            max_L += 2;
+            
             if(val > max_L) {
                 // No space enough to expand the progress bar
                 // Do some animation...

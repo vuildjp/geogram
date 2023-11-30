@@ -424,15 +424,6 @@ namespace GEO {
         void commit_insert_transaction() override;
         void rollback_insert_transaction() override;
         
-        void begin_pred_cache_transaction() {
-            use_pred_cache_insert_buffer_ = true;
-        }
-        void end_pred_cache_transaction() {
-            use_pred_cache_insert_buffer_ = false;
-        }
-        void commit_pred_cache_insert_buffer();
-        void clear_pred_cache_insert_buffer();
-        
     private:
         MeshSurfaceIntersection& exact_mesh_;
         const Mesh& mesh_;
@@ -495,6 +486,263 @@ namespace GEO {
         TriangleRegion B_rgn_f1;
         TriangleRegion B_rgn_f2;
     };
+
+    /**********************************************************************/
+
+    /**
+     * \brief Constrained Delaunay Triangulation with vertices that are
+     *  exact points.
+     * \details Inherits CDTBase2d (constrained Delaunay triangulation), and
+     *  redefines orient2d(), incircle2d() and create_intersection() using
+     *  vectors with homogeneous coordinates stored as arithmetic expansions
+     *  (vec2HE) or arbitrary-precision floating point numbers (vec2HEx) if
+     *  compiled with Tessael's geogramplus extension package.
+     */
+    class ExactCDT2d : public CDTBase2d {
+    public:
+        typedef MeshSurfaceIntersection::ExactVec2H ExactPoint;
+        typedef MeshSurfaceIntersection::ExactCoord ExactCoord;
+        typedef MeshSurfaceIntersection::ExactVec2 ExactVec2;
+        typedef MeshSurfaceIntersection::ExactVec2H ExactVec2H;
+        typedef MeshSurfaceIntersection::ExactRational ExactRational;
+
+        ExactCDT2d();
+        ~ExactCDT2d() override;
+        
+        /**
+         * \copydoc CDTBase2d::clear()
+         */
+        void clear() override;
+
+        /**
+         * \brief Inserts a point
+         * \param[in] p the point to be inserted
+         * \param[in] hint a triangle not too far away from the point to
+         *  be inserted
+         * \return the index of the created point. Duplicated points are
+         *  detected (and then the index of the existing point is returned)
+         */
+        index_t insert(
+            const ExactPoint& p, index_t id, index_t hint = index_t(-1)
+        );
+
+        void insert_constraint(index_t v1, index_t v2, index_t operand_bits) {
+            constraints_.push_back(bindex(v1,v2,bindex::KEEP_ORDER));
+            cnstr_operand_bits_.push_back(operand_bits);
+            CDTBase2d::insert_constraint(v1,v2);
+        }
+        
+        /**
+         * \brief Creates a first large enclosing quad
+         * \param[in] p1 , p2 , p3 , p4 the four vertices of the quad
+         * \details The quad needs to be convex. 
+         *  create_enclosing_rectangle() or create_enclosing_quad()  
+         *  need to be called before anything else
+         */
+        void create_enclosing_quad(
+            const ExactPoint& p1, const ExactPoint& p2,
+            const ExactPoint& p3, const ExactPoint& p4
+        );
+
+
+        /**
+         * \brief Creates a first large enclosing rectangle
+         * \param[in] x1 , y1 , x2 , y2 rectangle bounds
+         * \details create_enclosing_triangle(), create_enclosing_rectangle() 
+         *  or create_enclosing_quad() need to be called before anything else
+         */
+        void create_enclosing_rectangle(
+            double x1, double y1, double x2, double y2
+        ) {
+            create_enclosing_quad(
+                ExactPoint(vec2(x1,y1)),
+                ExactPoint(vec2(x2,y1)),
+                ExactPoint(vec2(x2,y2)),
+                ExactPoint(vec2(x1,y2))
+            );
+        }
+
+        /**
+         * \brief Gets a point by vertex index
+         * \param[in] v vertex index
+         * \return the point at index \p v
+         */
+        const ExactPoint& vertex_point(index_t v) const {
+            geo_debug_assert(v < nv());
+            return point_[v];
+        }
+
+        /**
+         * \brief Gets a vertex id by index
+         * \param[in] v vertex index
+         * \return the point at index \p v
+         */
+        index_t vertex_id(index_t v) const {
+            geo_debug_assert(v < nv());
+            return id_[v];
+        }
+
+        /**
+         * \brief Sets a vertex id by index
+         * \param[in] v vertex index
+         * \param[in] id vertex id
+         */
+        void set_vertex_id(index_t v, index_t id) {
+            geo_debug_assert(v < nv());
+            id_[v] = id;
+        }
+
+        void classify_triangles(const std::string& boolean_expression);
+        
+        void save(const std::string& filename) const override;
+        
+    protected:
+        void add_point(const ExactPoint& p, index_t id = index_t(-1));
+        void begin_insert_transaction() override;
+        void commit_insert_transaction() override;
+        void rollback_insert_transaction() override;
+        
+        /**
+         * \copydoc CDTBase2d::orient_2d()
+         */
+        Sign orient2d(index_t i, index_t j, index_t k) const override;
+
+        /**
+         * \copydoc CDTBase2d::incircle()
+         */
+        Sign incircle(index_t i,index_t j,index_t k,index_t l) const override;
+
+        /**
+         * \copydoc CDTBase2d::create_intersection()
+         */
+        index_t create_intersection(
+            index_t E1, index_t i, index_t j,
+            index_t E2, index_t k, index_t l
+        ) override;
+        
+    protected:
+        vector<ExactPoint> point_;
+#ifndef INTERSECTIONS_USE_EXACT_NT            
+        vector<double> length_;
+#endif        
+        vector<index_t> id_;
+        vector<index_t> cnstr_operand_bits_;
+        vector<index_t> facet_inclusion_bits_;
+        mutable std::map<trindex, Sign> pred_cache_;
+        bool use_pred_cache_insert_buffer_;
+        mutable std::vector< std::pair<trindex, Sign> > pred_cache_insert_buffer_;
+        vector<bindex> constraints_;
+    };
+    
+    /**********************************************************************/
+
+    /**
+     * \brief Detects and retriangulates a set of coplanar facets for
+     *  MeshSurfaceIntersection.
+     */
+    class CoplanarFacets {
+    public:
+        static constexpr index_t NO_INDEX = index_t(-1);
+        static constexpr index_t NON_MANIFOLD = index_t(-2);
+        typedef MeshSurfaceIntersection::ExactPoint ExactPoint;
+        typedef MeshSurfaceIntersection::ExactVec3 ExactVec3;
+        typedef MeshSurfaceIntersection::ExactVec2H ExactVec2H;
+
+        /**
+         * \brief Constructs a CoplanarFacets object associated with a
+         *   MeshSurfaceIntersection
+         * \details No set of facets is identified. One needs to call get().
+         * \param[in] I a reference to the MeshSurfaceIntersection
+         */
+        CoplanarFacets(MeshSurfaceIntersection& I);
+
+        /**
+         * \brief Gets the set of coplanar facets from a given facet and
+         *   group id.
+         * \details Uses the "group" facets attribute. If \p f's group is
+         *  uninitialized (NO_INDEX), determines the facets of the group
+         *  geometrically and initializes the attribute, else gets the
+         *  facets based on the attribute.
+         * \param[in] f the facet
+         * \param[in] group_id the facet group id
+         */
+        void get(index_t f, index_t group_id);
+
+        /**
+         * \brief Marks the vertices that need to be kept in the simplified facets.
+         * \details A vertex is kept if it is incident to at least two non-colinear
+         *  edges on the border. The status of the vertices is stored in the
+         *  "keep" vertex attribute.
+         */
+        void mark_vertices_to_keep();
+
+        /**
+         * \brief For debugging purposes, saves border edges to a file.
+         * \param[in] filename the file where to store the borders.
+         */
+        void save_borders(const std::string& filename);
+
+        /**
+         * \brief For debugging purposes, saves all the facets of the group 
+         *  to a file.
+         * \param[in] filename the file where to store the facets of the group.
+         */
+        void save_facet_group(const std::string& filename);
+
+        /**
+         * \brief Triangulates the kept vertices.
+         * \details One can get the triangle through the (public) CDT member
+         *  (ExactCDT2d).
+         */
+        void triangulate();
+        
+    protected:
+
+        /**
+         * \brief Gets the coordinate along which one can project a triangle
+         *  without creating degeneracies.
+         * \param[in] p1 , p2 , p3 the three vertices of the triangle, with
+         *   exact homogeneous coordinates.
+         * \return one of {0,1,2}
+         */
+        static coord_index_t triangle_normal_axis(
+            const ExactPoint& p1, const ExactPoint& p2, const ExactPoint& p3
+        );
+
+        /**
+         * \brief Tests whether two adjacent triangles are coplanar
+         * \details This is used to determine the facets that can be
+         *  merged
+         * \param[in] P1 , P2 , P3 , P4 the vertices of the triangles,
+         *  as points with exact homogeneous coordinates. The two triangles
+         *  are \p P1, \p P2, \p P3 and \p P2, \p P1, \p P4
+         * \retval true if the two triangles are coplanar
+         * \retval false otherwise
+         */
+        static bool triangles_are_coplanar(
+            const ExactPoint& P1, const ExactPoint& P2,
+            const ExactPoint& P3, const ExactPoint& P4
+        );
+
+    public:
+        vector<index_t> facets;
+        vector<index_t> vertices;
+        ExactCDT2d      CDT;
+        
+    private:
+        MeshSurfaceIntersection& intersection_;
+        Mesh& mesh_;
+        index_t group_id_;
+        Attribute<index_t> facet_group_;
+        Attribute<bool> keep_vertex_;
+        vector<index_t> v_prev_;
+        vector<index_t> v_next_;
+        vector<bool>    f_visited_;
+        vector<bool>    v_visited_;
+        vector<index_t> v_idx_;
+    };
+
+    /**********************************************************************/    
     
 }
 

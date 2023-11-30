@@ -148,6 +148,12 @@ namespace GEO {
          *  - "intersection" (intersection of everything).
          */
         void classify(const std::string& expr);
+
+        /**
+         * \brief Merge coplanar facets and retriangulate them using a 
+         *  Constrained Delaunay triangulation
+         */
+        void simplify_coplanar_facets();
         
         /**
          * \brief Display information while computing the intersection.
@@ -218,6 +224,16 @@ namespace GEO {
             normalize_ = x;
         }
 
+
+        /**
+         * \brief Optionally save the skeleton (that is, the collection of 
+         *  non-manifold edges) to a given mesh.
+         * \param[in] skeleton a pointer to the mesh that will receive the
+         *  skeleton.
+         */
+        void set_build_skeleton(Mesh* skeleton) {
+            skeleton_ = skeleton;
+        }
         
     protected:
         /**
@@ -583,7 +599,6 @@ namespace GEO {
              */
             Sign h_refNorient(index_t h2) const;
 
-
         public:
             void test(index_t h1, index_t h2) {
                 (*this)(h1,h2);
@@ -632,6 +647,7 @@ namespace GEO {
         bool use_radial_sort_;
 
         PCK::SOSMode SOS_bkp_;
+        bool rescale_; 
         bool normalize_;
         vec3 normalize_center_;
         double normalize_radius_;
@@ -639,6 +655,9 @@ namespace GEO {
         index_t monster_threshold_;
         bool dry_run_;
         friend class MeshInTriangle;
+        friend class CoplanarFacets;
+
+        Mesh* skeleton_;
     };
     
     /********************************************************************/    
@@ -650,9 +669,12 @@ namespace GEO {
      * \param[in] A , B the two operands.
      * \param[out] result the computed mesh.
      * \param[in] operation one of "A+B", "A*B", "A-B", "B-A"
+     * \param[in] verbose if set, display additional information 
+     *   during computation
      */
     void GEOGRAM_API mesh_boolean_operation(
-        Mesh& result, Mesh& A, Mesh& B, const std::string& operation
+        Mesh& result, Mesh& A, Mesh& B, const std::string& operation,
+        bool verbose=false
     );
     
     /**
@@ -661,8 +683,12 @@ namespace GEO {
      *  mesh without intersections.
      * \param[in] A , B the two operands.
      * \param[out] result the computed mesh.
+     * \param[in] verbose if set, display additional 
+     *  information during computation
      */
-    void GEOGRAM_API mesh_union(Mesh& result, Mesh& A, Mesh& B);
+    void GEOGRAM_API mesh_union(
+        Mesh& result, Mesh& A, Mesh& B, bool verbose=false
+    );
 
     /**
      * \brief Computes the intersection of two surface meshes.
@@ -670,8 +696,12 @@ namespace GEO {
      *  mesh without intersections.
      * \param[in] A , B the two operands.
      * \param[out] result the computed mesh.
+     * \param[in] verbose if set, display additional information 
+     *  during computation
      */
-    void GEOGRAM_API mesh_intersection(Mesh& result, Mesh& A, Mesh& B);
+    void GEOGRAM_API mesh_intersection(
+        Mesh& result, Mesh& A, Mesh& B, bool verbose=false
+    );
 
     /**
      * \brief Computes the difference of two surface meshes.
@@ -679,14 +709,22 @@ namespace GEO {
      *  mesh without intersections.
      * \param[in] A , B the two operands.
      * \param[out] result the computed mesh.
+     * \param[in] verbose if set, display additional information 
+     *  during computation
      */
-    void GEOGRAM_API mesh_difference(Mesh& result, Mesh& A, Mesh& B);
+    void GEOGRAM_API mesh_difference(
+        Mesh& result, Mesh& A, Mesh& B, bool verbose=false
+    );
     
     /**
      * \brief Attempts to make a surface mesh conformal by
      *  removing intersecting facets and re-triangulating the holes.
+     * \param[in] verbose if set, display additional information 
+     *  during computation
      */
-    void GEOGRAM_API mesh_remove_intersections(Mesh& M, index_t max_iter = 3);
+    void GEOGRAM_API mesh_remove_intersections(
+        Mesh& M, index_t max_iter = 3, bool verbose=false
+    );
 
     /**
      * \brief Tests whether two mesh facets have a non-degenerate intersection.

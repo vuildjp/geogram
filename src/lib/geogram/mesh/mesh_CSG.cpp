@@ -40,14 +40,20 @@
 #include <geogram/mesh/mesh_CSG.h>
 #include <geogram/mesh/mesh.h>
 #include <geogram/mesh/mesh_surface_intersection.h>
+#include <geogram/mesh/mesh_surface_intersection_internal.h>
 #include <geogram/mesh/mesh_fill_holes.h>
 #include <geogram/mesh/mesh_repair.h>
 #include <geogram/mesh/mesh_io.h>
+#include <geogram/mesh/mesh_geometry.h>
 #include <geogram/delaunay/delaunay.h>
+#include <geogram/image/image_library.h>
 #include <geogram/basic/command_line.h>
 #include <geogram/basic/logger.h>
 #include <geogram/basic/file_system.h>
 #include <geogram/basic/progress.h>
+#include <geogram/basic/line_stream.h>
+
+#include <cstdlib> 
 
 // Silence some warnings in stb_c_lexer.h
 
@@ -173,6 +179,15 @@ namespace GEO {
         for(index_t c=0; c<3; ++c) {
             bbox_.xyz_min[c] -= 1e-6;
             bbox_.xyz_max[c] += 1e-6;
+            /*
+            // nextafter triggers FPEs with denormals
+            bbox_.xyz_min[c] = std::nextafter(
+                bbox_.xyz_min[c], -std::numeric_limits<double>::infinity()
+            );
+            bbox_.xyz_max[c] = std::nextafter(
+                bbox_.xyz_max[c],  std::numeric_limits<double>::infinity()
+            );
+            */
         }
     }
 
@@ -189,6 +204,7 @@ namespace GEO {
         geo_assert(b->facets.are_simplices());
         index_t v_ofs = a->vertices.nb();
         index_t f_ofs = a->facets.nb();
+        index_t e_ofs = a->edges.nb();
         a->vertices.create_vertices(b->vertices.nb());
         a->facets.create_triangles(b->facets.nb());
         for(index_t v: b->vertices) {
@@ -208,10 +224,25 @@ namespace GEO {
             index_t f1 = b->facets.adjacent(f,0);
             index_t f2 = b->facets.adjacent(f,1);
             index_t f3 = b->facets.adjacent(f,2);
-            a->facets.set_adjacent(f + f_ofs, 0, f1 + f_ofs);
-            a->facets.set_adjacent(f + f_ofs, 1, f2 + f_ofs);
-            a->facets.set_adjacent(f + f_ofs, 2, f3 + f_ofs); 
+            if(f1 != index_t(-1)) {
+                f1 += f_ofs;
+            }
+            if(f2 != index_t(-1)) {
+                f2 += f_ofs;
+            }
+            if(f3 != index_t(-1)) {
+                f3 += f_ofs;
+            }
+            a->facets.set_adjacent(f + f_ofs, 0, f1);
+            a->facets.set_adjacent(f + f_ofs, 1, f2);
+            a->facets.set_adjacent(f + f_ofs, 2, f3); 
         }
+        for(index_t e: b->edges) {
+            index_t v1 = b->edges.vertex(e,0);
+            index_t v2 = b->edges.vertex(e,1);
+            a->edges.create_edge(v1 + v_ofs, v2 + v_ofs);
+        }
+        
         for(index_t c=0; c<3; ++c) {
             bbox_.xyz_min[c] = std::min(
                 bbox_.xyz_min[c], other->bbox().xyz_min[c]
@@ -221,9 +252,13 @@ namespace GEO {
             );
         }
         if(operand != index_t(-1)) {
-            Attribute<index_t> operand_bit(facets.attributes(),"operand_bit");
+            Attribute<index_t> f_operand_bit(facets.attributes(),"operand_bit");
             for(index_t f=f_ofs; f<facets.nb(); ++f) {
-                operand_bit[f] = (1u << operand);
+                f_operand_bit[f] = index_t(1) << operand;
+            }
+            Attribute<index_t> e_operand_bit(edges.attributes(),"operand_bit");
+            for(index_t e=e_ofs; e<edges.nb(); ++e) {
+                e_operand_bit[e] = index_t(1) << operand;
             }
         }
     }
@@ -232,9 +267,10 @@ namespace GEO {
     
     CSGBuilder::CSGBuilder() {
         reset_defaults();
+        reset_file_path();        
         STL_epsilon_ = 1e-6;
-        create_center_vertex_ = true;
         verbose_ = false;
+        max_arity_ = 32;
     }
     
     void CSGBuilder::reset_defaults() {
@@ -268,6 +304,7 @@ namespace GEO {
         M->facets.create_triangle(0,2,3);
             
         M->facets.connect();
+        M->facets.compute_borders();
         M->update_bbox();
         return M;
     }
@@ -287,18 +324,12 @@ namespace GEO {
             M->vertices.create_vertex(vec2(x,y).data());
         }
 
-        if(create_center_vertex_) {
-            M->vertices.create_vertex(vec2(0.0,0.0).data());
-            for(index_t u=0; u<nu; ++u) {
-                M->facets.create_triangle(u, (u+1)%nu, nu);
-            }
-        } else {
-            for(index_t u=1; u+1<nu; ++u) {
-                M->facets.create_triangle(0,u,u+1);
-            }
+        for(index_t u=1; u+1<nu; ++u) {
+            M->facets.create_triangle(0,u,u+1);
         }
             
         M->facets.connect();
+        M->facets.compute_borders();        
         M->update_bbox();
         return M;
     }
@@ -351,7 +382,9 @@ namespace GEO {
     
     CSGMesh_var CSGBuilder::sphere(double r) {
         index_t nu = get_fragments_from_r(r);
-        index_t nv = index_t((nu / 2) + 1);
+        index_t nv = index_t((nu / 2) + 1); // TODO: I do not have exactly the
+                                            // same parameterization as OpenSCAD
+                                            // in v ...
 
         CSGMesh_var M = new CSGMesh;
         M->vertices.set_dimension(3);
@@ -397,10 +430,10 @@ namespace GEO {
                 // Create triangles, skip degenerate triangles
                 // around the poles.
                 if(v01 != v11) {
-                    M->facets.create_triangle(v00, v01, v11);
+                    M->facets.create_triangle(v00, v11, v01);
                 }
                 if(v00 != v10) {
-                    M->facets.create_triangle(v00, v11, v10);
+                    M->facets.create_triangle(v00, v10, v11);
                 }
             }
         }
@@ -449,24 +482,10 @@ namespace GEO {
         }
 
         // Capping
-        if(create_center_vertex_) {
-            index_t v1 = M->vertices.create_vertex(vec3(0,0,z1).data());
-            index_t v2 = index_t(-1);
+        for(index_t u=1; u+1<nu; ++u) {
+            M->facets.create_triangle(0,u+1,u);
             if(r2 != 0.0) {
-                v2 = M->vertices.create_vertex(vec3(0,0,z2).data());
-            }
-            for(index_t u=0; u<nu; ++u) {
-                M->facets.create_triangle(v1,u,(u+1)%nu);
-                if(r2 != 0.0) {
-                    M->facets.create_triangle(v2,nu+(u+1)%nu,nu+u);
-                }
-            }
-        } else {
-            for(index_t u=1; u+1<nu; ++u) {
-                M->facets.create_triangle(0,u,u+1);
-                if(r2 != 0.0) {
-                    M->facets.create_triangle(nu,nu+u+1,nu+u);
-                }
+                M->facets.create_triangle(nu,nu+u,nu+u+1);
             }
         }
 
@@ -477,8 +496,8 @@ namespace GEO {
                 index_t v01 = v00 + nu;
                 index_t v10 = (u+1)%nu;
                 index_t v11 = v10 + nu;
-                M->facets.create_triangle(v00, v01, v11);
-                M->facets.create_triangle(v00, v11, v10);
+                M->facets.create_triangle(v00, v11, v01);
+                M->facets.create_triangle(v00, v10, v11);
             } else {
                 M->facets.create_triangle(u, (u+1)%nu, nu);
             }
@@ -489,46 +508,373 @@ namespace GEO {
         return M;
     }
 
-    CSGMesh_var CSGBuilder::import(const std::string& filename) {
-        CSGMesh_var result = new CSGMesh;
-        if(!mesh_load(filename, *result)) {
-            result.reset();
+    CSGMesh_var CSGBuilder::import(
+        const std::string& filename, const std::string& layer, index_t timestamp,
+        vec2 origin, vec2 scale
+    ) {
+        CSGMesh_var result;
+        
+        std::string full_filename = filename;
+        if(!find_file(full_filename)) {
+            Logger::err("CSG") << filename << ": file not found"
+                               << std::endl;
             return result;
         }
-        std::string ext = FileSystem::extension(filename);
-        String::to_lowercase(ext);
-        if( ext == "stl") {
-            MeshRepairMode mode = MESH_REPAIR_DEFAULT;
-            if(!verbose_) {
-                mode = MeshRepairMode(mode | MESH_REPAIR_QUIET);
+
+        if(String::to_lowercase(FileSystem::extension(filename)) == "dxf") {
+            result = import_with_openSCAD(full_filename, layer, timestamp);
+        } else {
+            result = new CSGMesh;
+            MeshIOFlags io_flags;
+            io_flags.set_verbose(verbose_);
+            if(!mesh_load(full_filename, *result, io_flags)) {
+                result.reset();
+                return result;
             }
-            mesh_repair(*result, mode, STL_epsilon_);
+            std::string ext = FileSystem::extension(filename);
+            String::to_lowercase(ext);
+            if( ext == "stl") {
+                MeshRepairMode mode = MESH_REPAIR_DEFAULT;
+                if(!verbose_) {
+                    mode = MeshRepairMode(mode | MESH_REPAIR_QUIET);
+                }
+                mesh_repair(*result, mode, STL_epsilon_);
+            }
+            result->facets.compute_borders();
         }
+
+        // Apply origin and scale
+        // TODO: check, is it origin + coord*scale or (origin + coord)*scale ?
+        for(index_t v: result->vertices) {
+            double* p = result->vertices.point_ptr(v);
+            p[0] = (p[0] - origin.x) * scale.x;
+            p[1] = (p[1] - origin.y) * scale.y;
+        }
+
+        if(result->vertices.dimension() == 3) {
+            bool z_all_zero = true;
+            for(index_t v: result->vertices) {
+                if(result->vertices.point_ptr(v)[2] != 0.0) {
+                    z_all_zero = false;
+                    break;
+                }
+            }
+            if(z_all_zero) {
+                result->vertices.set_dimension(2);
+            }
+        }
+        
         result->update_bbox();
         return result;
     }
 
+
+    CSGMesh_var CSGBuilder::import_with_openSCAD(
+        const std::string& filename, const std::string& layer, index_t timestamp
+    ) {
+        CSGMesh_var result;
+
+        std::string path = FileSystem::dir_name(filename);
+        std::string base = FileSystem::base_name(filename);
+        std::string extension = FileSystem::extension(filename);
+
+        std::string geogram_file
+            = path + "/" + "geogram_" + base +
+              "_" + extension +
+              "_" + layer + "_" +
+              String::to_string(timestamp) + ".stl";
+
+        if(FileSystem::is_file(geogram_file)) {
+            result = import(geogram_file);
+            result->vertices.set_dimension(2);
+            return result;
+        }
+
+        Logger::out("CSG") << "Did not find " << geogram_file << std::endl;
+        Logger::out("CSG") << "Trying to create it with OpenSCAD" << std::endl;
+        
+        // Generate a simple linear extrusion, so that we can convert to STL
+        // (without it OpenSCAD refuses to create a STL with 2D content)
+        std::ofstream tmp("tmpscad.scad");
+        tmp << "group() {" << std::endl;
+        tmp << "   linear_extrude(height=1.0) {" << std::endl;
+        tmp << "      import(" << std::endl;
+        tmp << "          file = \"" << filename << "\"," << std::endl;
+        tmp << "          layer = \"" << layer << "\"," << std::endl;
+        tmp << "          timestamp = " << timestamp << std::endl;
+        tmp << "      );" << std::endl;
+        tmp << "   }" << std::endl;
+        tmp << "}" << std::endl;
+
+        // Start OpenSCAD and generate output as STL
+        if(system("openscad tmpscad.scad -o tmpscad.stl")) {
+            Logger::err("CSG") << "Could not exec openscad " << std::endl;
+            Logger::err("CSG") << "(needed to import " << filename << ")"
+                               << std::endl;
+            return result;
+        }
+
+        // Load STL using our own loader
+        result = import("tmpscad.stl");
+
+        FileSystem::delete_file("tmpscad.scad");        
+        FileSystem::delete_file("tmpscad.stl");
+        
+        // Delete the facets that are coming from the linear extrusion
+        vector<index_t> delete_f(result->facets.nb(),0);
+        for(index_t f: result->facets) {
+            for(index_t lv=0; lv<result->facets.nb_vertices(f); ++lv) {
+                index_t v = result->facets.vertex(f,lv);
+                if(result->vertices.point_ptr(v)[2] != 0.0) {
+                    delete_f[f] = 1;
+                }
+            }
+        }
+        result->facets.delete_elements(delete_f);
+        mesh_save(*result, geogram_file);
+        result->vertices.set_dimension(2);
+        return result;
+    }
+
+    CSGMesh_var CSGBuilder::surface(
+        const std::string& filename, bool center, bool invert
+    ) {
+        CSGMesh_var result;
+        std::string full_filename = filename;
+        if(!find_file(full_filename)) {
+            Logger::err("CSG") << filename << ": file not found"
+                               << std::endl;
+            return result;
+        }
+
+        Image_var image;
+        
+        if(String::to_lowercase(FileSystem::extension(filename)) == "dat") {
+            image = load_dat_image(full_filename);
+        } else {
+            image = ImageLibrary::instance()->load_image(full_filename);
+        }
+
+        if(image.is_null()) {
+            Logger::err("CSG") << filename << ": could not load"
+                               << std::endl;
+            return result;
+        }
+
+        if(image->color_encoding() != Image::GRAY ||
+           image->component_encoding() != Image::FLOAT64
+        ) {
+            Logger::err("CSG") << "surface: images not supported yet"
+                               << std::endl;
+            image.reset();
+            return result;
+        }
+
+        index_t nu = image->width();
+        index_t nv = image->height();
+
+        double z1 = Numeric::max_float64();
+        
+        result = new CSGMesh;
+        result->vertices.set_dimension(3);
+        result->vertices.create_vertices(image->width() * image->height());
+        for(index_t v=0; v < nv; ++v) {
+            for(index_t u=0; u<nu; ++u) {
+                double* p = result->vertices.point_ptr(v*nu+u);
+                double x = double(u);
+                double y = double(v);
+                double z = image->pixel_base_float64_ptr(u,v)[0];
+                if(invert) {
+                    z = 1.0 - z;
+                }
+                if(center) {
+                    x -= double(nu-1.0)/2.0;
+                    y -= double(nv-1.0)/2.0;
+                }
+                p[0] = x;
+                p[1] = y;
+                p[2] = z;
+                z1 = std::min(z1,z);
+            }
+        }
+
+        z1 -= 1.0;
+
+        // Could be a bit smarter here (in the indexing, to generate
+        // walls and z1 faces directly), but I was lazy...
+        
+        for(index_t v=0; v+1< nv; ++v) {
+            for(index_t u=0; u+1<nu; ++u) {
+                index_t v00 = v*nu+u;
+                index_t v10 = v*nu+u+1;
+                index_t v01 = (v+1)*nu+u;
+                index_t v11 = (v+1)*nu+u+1;
+                vec3 p00(result->vertices.point_ptr(v00));
+                vec3 p10(result->vertices.point_ptr(v10));
+                vec3 p01(result->vertices.point_ptr(v01));
+                vec3 p11(result->vertices.point_ptr(v11));
+                vec3 p = 0.25*(p00+p10+p01+p11);
+                index_t w = result->vertices.create_vertex(p.data());
+                result->facets.create_triangle(v00,v10,w);
+                result->facets.create_triangle(v10,v11,w);
+                result->facets.create_triangle(v11,v01,w);
+                result->facets.create_triangle(v01,v00,w);
+            }
+        }
+
+        result->facets.connect();
+
+        vector<index_t> projected(result->vertices.nb(), index_t(-1));
+        for(index_t f: result->facets) {
+            for(index_t le=0; le<3; ++le) {
+                if(result->facets.adjacent(f,le) == index_t(-1)) {
+                    for(index_t dle=0; dle<2; ++dle) {
+                        index_t v = result->facets.vertex(f, (le+dle)%3);
+                        if(projected[v] == index_t(-1)) {
+                            vec3 p(result->vertices.point_ptr(v));
+                            p.z = z1;
+                            projected[v] = result->vertices.create_vertex(p.data());
+                        }
+                    }
+                }
+            }
+        }
+        
+        for(index_t f: result->facets) {
+            for(index_t le=0; le<3; ++le) {
+                if(result->facets.adjacent(f,le) == index_t(-1)) {
+                    index_t v1 = result->facets.vertex(f,le);
+                    index_t v2 = result->facets.vertex(f,(le+1)%3);
+                    result->facets.create_triangle(v2,v1,projected[v2]);
+                    result->facets.create_triangle(projected[v2],v1,projected[v1]);
+                }
+            }
+        }
+
+        result->facets.connect();
+        fill_holes(*result,1e6);
+        tessellate_facets(*result,3);
+        result->update_bbox();
+        return result;
+    }
+
+    Image* CSGBuilder::load_dat_image(const std::string& file_name) {
+        LineInput in(file_name);
+
+        index_t nrows  = index_t(-1);
+        index_t ncols  = index_t(-1);
+        Image* result = nullptr;
+        
+        try {
+            while( !in.eof() && in.get_line() && in.current_line()[0] == '#') {
+                in.get_fields();
+                if(in.field_matches(1,"type:") && !in.field_matches(2,"matrix")) {
+                    Logger::err("CSG") << "dat file: wrong type: "
+                                       << in.field(2)
+                                       << " (only \'matrix\' is supported)"
+                                       << std::endl;
+                    return nullptr;
+                } else if(in.field_matches(1,"rows:")) {
+                    nrows = in.field_as_uint(2);
+                } else if(in.field_matches(1,"columns:")) {
+                    ncols = in.field_as_uint(2);
+                }
+            }
+
+            result = new Image(
+                Image::GRAY, Image::FLOAT64, ncols, nrows
+            );
+            
+            for(index_t y=0; y<nrows; ++y) {
+                in.get_fields();
+                for(index_t x=0; x<ncols; ++x) {
+                    result->pixel_base_float64_ptr(x,y)[0] = in.field_as_double(x);
+                }
+                in.get_line();
+            }
+        } catch(const std::logic_error& ex) {
+            Logger::err("CSG") << "invalid dat file:" << ex.what() << std::endl;
+            delete result;
+            return nullptr;
+        }
+        
+        return result;
+    }
+        
+
+
+    bool CSGBuilder::find_file(std::string& filename) {
+        if(FileSystem::is_file(filename)) {
+            return true;
+        }
+        
+        for(std::string& path: file_path_) {
+            std::string full_filename = path + "/" + filename;
+            if(FileSystem::is_file(full_filename)) {
+                filename = full_filename;
+                return true;
+                break;
+            }
+        }
+        return false;
+    }
     
     /****** Instructions ****/
     
     CSGMesh_var CSGBuilder::multmatrix(const mat4& M, const CSGScope& scope) {
         CSGMesh_var result = group(scope);
+        index_t dim = result->vertices.dimension();
         for(index_t v: result->vertices) {
-            vec3 p(result->vertices.point_ptr(v));
-            p = transform_point(M,p);
-            result->vertices.point_ptr(v)[0] = p.x;
-            result->vertices.point_ptr(v)[1] = p.y;
-            result->vertices.point_ptr(v)[2] = p.z;
+            double* p = result->vertices.point_ptr(v);
+            double x = p[0];
+            double y = p[1];
+            double z = (dim == 3) ? p[2] : 0.0;
+            vec3 P(x,y,z);
+            P = transform_point(M,P);
+            for(index_t c=0; c<dim; ++c) {
+                p[c] = P[c];
+            }
+        }
+        if(det(M) < 0.0) {
+            for(index_t f: result->facets) {
+                result->facets.flip(f);
+            }
         }
         result->update_bbox();
         return result;
     }
 
     CSGMesh_var CSGBuilder::union_instr(const CSGScope& scope) {
+
+        /*
+        for(index_t i=0; i<scope.size(); ++i) {
+            mesh_save(*scope[i], String::format("scope_%05d.geogram",int(i)));
+        }
+        */
+        
         if(scope.size() == 1) {
             return scope[0];
         }
 
+        // Boolean operations can handle no more than 32 operands.
+        // For a union with more than 32 operands, split it into two.
+        if(scope.size() > max_arity_) {
+            CSGScope scope1;
+            CSGScope scope2;
+            index_t n1 = index_t(scope.size()/2);
+            for(index_t i=0; i<scope.size(); ++i) {
+                if(i < n1) {
+                    scope1.push_back(scope[i]);
+                } else {
+                    scope2.push_back(scope[i]);
+                }
+            }
+            CSGScope scope3;
+            scope3.push_back(union_instr(scope1));
+            scope3.push_back(union_instr(scope2));
+            return union_instr(scope3);
+        }
+        
         bool may_have_intersections = false;
         for(index_t i=0; i<scope.size(); ++i) {
             for(index_t j=i+1; j<scope.size(); ++j) {
@@ -540,45 +886,44 @@ namespace GEO {
         }
 
         CSGMesh_var result = append(scope);
-        if(result->vertices.dimension() != 3) {
-            throw(std::logic_error("2D CSG operations not implemented yet"));
-        }
         
         if(may_have_intersections) {
-            MeshSurfaceIntersection I(*result);
-            I.set_verbose(verbose_);
-            I.intersect();
-            I.classify("union");
-            post_process(result);
+            do_CSG(result, "union");
         }
-        
+
+        post_process(result);
         result->update_bbox();
         return result;
     }
 
+    
     CSGMesh_var CSGBuilder::intersection(const CSGScope& scope) {
         if(scope.size() == 1) {
             return scope[0];
         }
 
-        if(scope[0]->vertices.dimension() != 3) {
-            throw(std::logic_error("2D CSG operations not implemented yet"));
-        }
-        
-        if(scope.size() == 2) {
-            CSGMesh_var result = new CSGMesh;
-            mesh_intersection(*result, *scope[0], *scope[1]);
-            post_process(result);
-            result->update_bbox();
-            return result;
+        // Boolean operations can handle no more than 32 operands.
+        // For a intersection with more than 32 operands, split it into two.
+        if(scope.size() > max_arity_) {
+            CSGScope scope1;
+            CSGScope scope2;
+            index_t n1 = index_t(scope.size()/2);
+            for(index_t i=0; i<scope.size(); ++i) {
+                if(i < n1) {
+                    scope1.push_back(scope[i]);
+                } else {
+                    scope2.push_back(scope[i]);
+                }
+            }
+
+            CSGScope scope3;
+            scope3.push_back(union_instr(scope1));
+            scope3.push_back(union_instr(scope2));
+            return intersection(scope3);
         }
 
-        CSGScope scope2(scope);
-        CSGMesh_var M1 = scope2.back();
-        scope2.pop_back();
-        CSGMesh_var M2 = intersection(scope2);
-        CSGMesh_var result = new CSGMesh;
-        mesh_intersection(*result, *M1, *M2);
+        CSGMesh_var result = append(scope);
+        do_CSG(result, "intersection");
         post_process(result);
         result->update_bbox();
         return result;
@@ -589,25 +934,28 @@ namespace GEO {
             return scope[0];
         }
 
-        if(scope[0]->vertices.dimension() != 3) {
-            throw(std::logic_error("2D CSG operations not implemented yet"));
-        }
-        
-        if(scope.size() == 2) {
-            CSGMesh_var result = new CSGMesh;
-            mesh_difference(*result, *scope[0], *scope[1]);
-            post_process(result);
-            result->update_bbox();
-            return result;
+        // Boolean operations can handle no more than 32 operands.
+        // For a difference with more than 32 operands, split it
+        // (by calling union_instr() that in turn splits the list).
+        if(scope.size() > max_arity_) {
+            CSGScope scope2;
+            for(index_t i=1; i<scope.size(); ++i) {
+                scope2.push_back(scope[i]);
+            }
+            CSGScope scope3;
+            scope3.push_back(scope[0]);
+            scope3.push_back(union_instr(scope2));
+            return difference(scope3);
         }
 
-        CSGScope scope2;
+        CSGMesh_var result = append(scope);
+        // construct the expression x0-x1-x2...-xn
+        std::string expr = "x0";
         for(index_t i=1; i<scope.size(); ++i) {
-            scope2.push_back(scope[i]);
+            expr += "-x" + String::to_string(i);
         }
-        CSGMesh_var op2 = group(scope2);
-        CSGMesh_var result = new CSGMesh;
-        mesh_difference(*result, *scope[0], *op2);
+
+        do_CSG(result, expr);
         post_process(result);
         result->update_bbox();
         return result;
@@ -688,15 +1036,34 @@ namespace GEO {
             result->facets.assign_triangle_mesh(3, points, tri2v, true);
             result->vertices.remove_isolated();
         } else {
-            // TODO: 2D hull
-            throw(std::logic_error("hull() only implemented in 3d (for now)"));
+            result->vertices.set_dimension(2);
+            result->vertices.create_vertices(nb_pts);
+            Memory::copy(
+                result->vertices.point_ptr(0), points.data(),
+                sizeof(double)*2*nb_pts
+            );
+            for(index_t t = delaunay->nb_finite_cells();
+                t < delaunay->nb_cells(); ++t
+            ) {
+                signed_index_t v1=-1,v2=-1;
+                for(index_t lv=0; lv<3; ++lv) {
+                    if(delaunay->cell_vertex(t,lv) == -1) {
+                        v1 = delaunay->cell_vertex(t,(lv+1)%3);
+                        v2 = delaunay->cell_vertex(t,(lv+2)%3);
+                    }
+                }
+                geo_assert(v1 != -1 && v2 != -1);
+                result->edges.create_edge(index_t(v1),index_t(v2));
+            }
+            result->vertices.remove_isolated();
         }
         result->update_bbox();            
         return result;
     }
 
     CSGMesh_var CSGBuilder::linear_extrude(
-        const CSGScope& scope, double height, bool center, vec2 scale
+        const CSGScope& scope, double height, bool center, vec2 scale,
+        index_t slices, double twist
     ) {
         double z1 = center ? -height/2.0 : 0.0;
         double z2 = center ?  height/2.0 : height;
@@ -707,87 +1074,538 @@ namespace GEO {
                       "linear_extrude: mesh is not of dimension 2"
             ));
         }
+        if(M->facets.nb() == 0) {
+            triangulate(M,"union");
+        }
         M->vertices.set_dimension(3);
 
         index_t nv  = M->vertices.nb();
         index_t nf  = M->facets.nb();
-        index_t nbv = 0;
-            
-        // Reorder vertices so that vertices on border come first
+        index_t nv_intern = 0;
+        index_t nv_border = 0;
+        
+        // Reorder vertices so that border vertices come first, then internal
+        // vertices
         {
             vector<index_t> reorder_vertices(M->vertices.nb(), index_t(-1));
             for(index_t f: M->facets) {
                 for(index_t le=0; le<3; ++le) {
                     if(M->facets.adjacent(f,le) == index_t(-1)) {
                         index_t v = M->facets.vertex(f,le);
-                        if(reorder_vertices[v] == index_t(-1)) {
-                            reorder_vertices[v] = nbv;
-                            ++nbv;
-                        }
+                        reorder_vertices[v] = nv_border;
+                        ++nv_border;
                     }
                 }
             }
-            index_t curv = nbv;
             for(index_t v: M->vertices) {
                 if(reorder_vertices[v] == index_t(-1)) {
-                    reorder_vertices[v] = curv;
-                    ++curv;
+                    reorder_vertices[v] = nv_intern + nv_border;
+                    ++nv_intern;
                 }
             }
-            M->vertices.permute_elements(reorder_vertices);
         }
 
+        geo_assert(nv_border + nv_intern == nv);
+
+        // Set z coordinates of all original vertices to z1
         for(index_t v: M->vertices) {
-            double x = M->vertices.point_ptr(v)[0];
-            double y = M->vertices.point_ptr(v)[1];
-            x *= scale.x; y *= scale.y;
             M->vertices.point_ptr(v)[2] = z1;
-            M->vertices.create_vertex(vec3(x,y,z2).data());
         }
-
-        for(index_t f=0; f<nf; ++f) {
-            M->facets.create_triangle(
-                M->facets.vertex(f,2) + nv,
-                M->facets.vertex(f,1) + nv,
-                M->facets.vertex(f,0) + nv
-            );
+        
+        if(slices == 0) {
+            slices = index_t(fn_);
         }
+        if(slices == 0 && twist != 0.0) {
+            double R = 0;
+            for(index_t v: M->vertices) {
+                const double* p = M->vertices.point_ptr(v);
+                R = std::max(R, geo_sqr(p[0])+geo_sqr(p[1]));
+                R = std::max(R, geo_sqr(p[0]*scale.x)+geo_sqr(p[1]*scale.y));
+            }
+            R = ::sqrt(R);
+            slices = get_fragments_from_r(R,twist);
+        }
+        slices = std::max(slices, index_t(1));
 
-        for(index_t f=0; f<nf; ++f) {
-            for(index_t le=0; le<3; ++le) {
-                if(M->facets.adjacent(f,le) == index_t(-1)) {
-                    index_t v1 = M->facets.vertex(f,le);
-                    index_t v2 = M->facets.vertex(f,(le+1)%3);
-                    index_t w1 = v1 + nv;
-                    index_t w2 = v2 + nv;
-                    M->facets.create_triangle(v2,v1,w2);
-                    M->facets.create_triangle(w2,v1,w1);
+        index_t first_border_offset = 0;
+        index_t border_offset = first_border_offset;
+
+        auto extrude_vertex = [&](index_t to_v, index_t from_v, double t) {
+            const double* ref = M->vertices.point_ptr(from_v);
+            double* target = M->vertices.point_ptr(to_v);
+            double s = 1.0 - t;
+            double z = s*z1 + t*z2;
+            vec2   sz = s*vec2(1.0, 1.0) + t*scale;
+
+            double x = ref[0] * sz.x;
+            double y = ref[1] * sz.y;
+
+            if(twist != 0.0) {
+                double alpha = twist*t*M_PI/180.0;
+                double ca = cos(alpha);
+                double sa = sin(alpha);
+                double x2 =  ca*x+sa*y;
+                double y2 = -sa*x+ca*y;
+                x = x2;
+                y = y2;
+            }
+            
+            target[0] = x;
+            target[1] = y;
+            target[2] = z;
+        };
+        
+        for(index_t Z=1; Z<=slices; ++Z) {
+            double t = double(Z)/double(slices);
+
+            // Special case: scaling = 0 (create a pole)
+            if(Z == slices && scale.x == 0.0 && scale.y == 0.0) {
+                double p[3] = {0.0, 0.0, z2};
+                index_t pole = M->vertices.create_vertex(p);
+                for(index_t f=0; f<nf; ++f) {
+                    for(index_t le=0; le<3; ++le) {
+                        if(M->facets.adjacent(f,le) == index_t(-1)) {
+                            index_t v1 = M->facets.vertex(f,le);
+                            index_t v2 = M->facets.vertex(f,(le+1)%3);
+                            v1 += border_offset;
+                            v2 += border_offset;
+                            M->facets.create_triangle(v2,v1,pole);
+                        }
+                    }
+                }
+                break;
+            }
+            
+            // Create vertices
+            index_t next_border_offset = M->vertices.create_vertices(nv_border);
+
+            // Extrude all vertices on border
+            for(index_t dv=0; dv<nv_border; ++dv) {
+                extrude_vertex(
+                    next_border_offset + dv,
+                    first_border_offset + dv,
+                    t
+                );
+            }
+
+            // Create walls
+            for(index_t f=0; f<nf; ++f) {
+                for(index_t le=0; le<3; ++le) {
+                    if(M->facets.adjacent(f,le) == index_t(-1)) {
+                        index_t v1 = M->facets.vertex(f,le);
+                        index_t v2 = M->facets.vertex(f,(le+1)%3);
+                        index_t w1 = v1 + next_border_offset;
+                        index_t w2 = v2 + next_border_offset;
+                        v1 += border_offset;
+                        v2 += border_offset;
+                        M->facets.create_triangle(v2,v1,w2);
+                        M->facets.create_triangle(w2,v1,w1);
+                    }
                 }
             }
-        }            
+            
+            border_offset = next_border_offset;
+        }
+
+        // Capping
+        if(scale.x != 0.0 || scale.y != 0.0) {
+            index_t vint_offset = M->vertices.create_vertices(nv_intern);
+            
+            // Create vertices for capping
+            for(index_t dv=0; dv<nv_intern; ++dv) {
+                extrude_vertex(vint_offset + dv, nv_border + dv, 1.0);
+            }
+            
+            for(index_t f=0; f<nf; ++f) {
+                index_t v[3];
+                for(index_t lv=0; lv<3; ++lv) {
+                    v[lv] = M->facets.vertex(f,lv);
+                    v[lv] = (v[lv] < nv_border) ?
+                               (border_offset+v[lv]) :
+                               (v[lv] - nv_border + vint_offset);
+                }
+                M->facets.create_triangle(v[2],v[1],v[0]);
+            }
+        }
             
         M->facets.connect();
+        M->edges.clear();
+
         M->update_bbox();    
         return M;
     }
 
+    
+    CSGMesh_var CSGBuilder::rotate_extrude(const CSGScope& scope, double angle) {
+        CSGMesh_var M = scope.size() == 1 ? scope[0] : group(scope);
+        if(M->vertices.dimension() != 2) {
+            throw(std::logic_error(
+                      "linear_extrude: mesh is not of dimension 2"
+            ));
+        }
+        
+        if(angle == 360.0) {
+            M->facets.clear();
+            M->vertices.remove_isolated();
+        } else if(M->facets.nb() == 0) {
+            triangulate(M,"union");
+        }
+
+        {
+            vector<index_t> remove_edge(M->edges.nb(),0);
+            for(index_t e: M->edges) {
+                index_t v1 = M->edges.vertex(e,0);
+                index_t v2 = M->edges.vertex(e,1);
+                if(
+                    M->vertices.point_ptr(v1)[0] == 0.0 &&
+                    M->vertices.point_ptr(v2)[0] == 0.0
+                ) {
+                    remove_edge[e] = 1;
+                }
+            }
+            M->edges.delete_elements(remove_edge);
+        }
+        
+        M->vertices.set_dimension(3);
+
+        index_t nv  = M->vertices.nb();
+        index_t nf  = M->facets.nb();
+        index_t nv_intern = 0;
+        index_t nv_border = 0;
+        
+        // Reorder vertices so that border vertices come first, then internal
+        // vertices
+        if(M->facets.nb() != 0) {
+            vector<index_t> reorder_vertices(M->vertices.nb(), index_t(-1));
+            for(index_t f: M->facets) {
+                for(index_t le=0; le<3; ++le) {
+                    if(M->facets.adjacent(f,le) == index_t(-1)) {
+                        index_t v = M->facets.vertex(f,le);
+                        reorder_vertices[v] = nv_border;
+                        ++nv_border;
+                    }
+                }
+            }
+            for(index_t v: M->vertices) {
+                if(reorder_vertices[v] == index_t(-1)) {
+                    reorder_vertices[v] = nv_intern + nv_border;
+                    ++nv_intern;
+                }
+            }
+        } else {
+            nv_border = nv;
+            nv_intern = 0;
+        }
+
+        geo_assert(nv_border + nv_intern == nv);
+
+        auto extrude_vertex = [&](index_t to_v, index_t from_v, double t) {
+            const double* ref = M->vertices.point_ptr(from_v);
+            double* target = M->vertices.point_ptr(to_v);
+            double alpha = t * 2.0 * M_PI * angle / 360.0;
+            double x = ref[0] * cos(alpha);
+            double y = ref[0] * sin(alpha);
+            double z = ref[1];
+            target[0] = x;
+            target[1] = y;
+            target[2] = z;
+        };
+
+
+        double R = 0.0;
+        for(index_t v: M->vertices) {
+            R = std::max(R, M->vertices.point_ptr(v)[0]);
+        }
+
+        index_t slices = get_fragments_from_r(R,angle);
+        
+        index_t first_border_offset = 0;
+        index_t border_offset = first_border_offset;
+
+        for(index_t Z=1; Z<=slices; ++Z) {
+            double t = double(Z)/double(slices);
+
+            index_t next_border_offset = 0;
+
+            if(Z != slices || angle != 360.0) {
+                // Create vertices
+                next_border_offset = M->vertices.create_vertices(nv_border);
+                
+                // Extrude all vertices on border
+                for(index_t dv=0; dv<nv_border; ++dv) {
+                    extrude_vertex(
+                        next_border_offset + dv,
+                        first_border_offset + dv,
+                        t
+                    );
+                }
+            }
+
+            // Create walls
+            for(index_t e: M->edges) {
+                index_t v1 = M->edges.vertex(e,0);
+                index_t v2 = M->edges.vertex(e,1);
+                index_t w1 = v1 + next_border_offset;
+                index_t w2 = v2 + next_border_offset;
+                v1 += border_offset;
+                v2 += border_offset;
+                M->facets.create_triangle(v2,v1,w2);
+                M->facets.create_triangle(w2,v1,w1);
+            }
+                
+            border_offset = next_border_offset;
+        }
+
+        // Capping
+        if(angle != 360.0) {
+            index_t vint_offset = M->vertices.create_vertices(nv_intern);
+            
+            // Create vertices for capping
+            for(index_t dv=0; dv<nv_intern; ++dv) {
+                extrude_vertex(vint_offset + dv, nv_border + dv, 1.0);
+            }
+            
+            for(index_t f=0; f<nf; ++f) {
+                index_t v[3];
+                for(index_t lv=0; lv<3; ++lv) {
+                    v[lv] = M->facets.vertex(f,lv);
+                    v[lv] = (v[lv] < nv_border) ?
+                               (border_offset+v[lv]) :
+                               (v[lv] - nv_border + vint_offset);
+                }
+                M->facets.create_triangle(v[2],v[1],v[0]);
+            }
+        }
+
+        // position first slide (I do that in the end, because we needed it u
+        // unmodified to use it as a reference before).
+        for(index_t v=0; v<nv_border; ++v) {
+            extrude_vertex(v, v, 0.0);
+        }
+
+        // Merge vertices at the poles if there were any (generated by initial
+        // vertices with zero x coordinate).
+        // TODO: do it more cleanly
+        MeshRepairMode mode = MESH_REPAIR_DEFAULT;
+        if(!verbose_) {
+            mode = MeshRepairMode(mode | MESH_REPAIR_QUIET);
+        }
+        mesh_repair(*M,mode);
+        
+        M->facets.connect();
+        M->edges.clear();
+
+        M->update_bbox();    
+        return M;
+    }
+
+    CSGMesh_var CSGBuilder::projection(const CSGScope& scope, bool cut) {
+        CSGMesh_var result = append(scope);
+        if(result->vertices.dimension() != 3) {
+            Logger::err("CSG") << "projection(): input mesh is not of dimenion 3"
+                               << std::endl;
+            result.reset();
+            return result;
+        }
+        if(cut) {
+            // An unelegant way of doing it: compute intersection with (enlarged)
+            // half bbox and keep z=0 facets only.
+
+            double x1 = result->bbox().xyz_min[0];
+            double y1 = result->bbox().xyz_min[1];
+            double z1 = result->bbox().xyz_min[2];
+            double x2 = result->bbox().xyz_max[0];
+            double y2 = result->bbox().xyz_max[1];
+            double z2 = result->bbox().xyz_max[2];
+            double dx = x2-x1;
+            double dy = y2-y1;
+            double dz = z2 - z1;
+            CSGMesh_var C = cube(2.0*vec3(3*dx,3*dy,3*dz), false);
+            for(index_t v: C->vertices) {
+                C->vertices.point_ptr(v)[0] += (x1 - dx); 
+                C->vertices.point_ptr(v)[1] += (y1 - dy); 
+            }
+            CSGScope scope;
+            scope.push_back(result);
+            scope.push_back(C);
+            result = difference(scope);
+            vector<index_t> remove_f(result->facets.nb(),0);
+            for(index_t f: result->facets) {
+                for(index_t lv=0; lv<result->facets.nb_vertices(f); ++lv) {
+                    index_t v = result->facets.vertex(f,lv);
+                    const double* p = result->vertices.point_ptr(v);
+                    if(p[2] != 0.0) {
+                        remove_f[f] = 1;
+                    }
+                }
+            }
+            result->facets.delete_elements(remove_f);
+            result->facets.compute_borders();
+            result->vertices.set_dimension(2);
+            result->update_bbox();
+            return result;
+        } else {
+            // Super unelegant brute force algorithm !!
+            // But just extracting the silhouette does not work because
+            // we need a smarter in/out classification algorithm, that
+            // seemingly cannot be expressed as a boolean expression
+            // passed to triangulate()
+            {
+            CSGScope scope;
+            for(index_t f: result->facets) {
+                const double* p1 = result->vertices.point_ptr(
+                    result->facets.vertex(f,0)
+                );
+                
+                const double* p2 = result->vertices.point_ptr(
+                    result->facets.vertex(f,1)
+                );
+                
+                const double* p3 = result->vertices.point_ptr(
+                    result->facets.vertex(f,2)
+                );
+
+                // I thought that I could have said here: != POSITIVE
+                // NOTE: different set of isolated vertices each time,
+                // there is something not normal.
+                if(PCK::orient_2d(p1,p2,p3) == ZERO) {
+                    continue;
+                }
+
+                CSGMesh_var F = new CSGMesh;
+                F->vertices.set_dimension(2);
+                
+                F->vertices.create_vertex(p1);
+                F->vertices.create_vertex(p2);
+                F->vertices.create_vertex(p3);
+                F->facets.create_triangle(0,1,2);
+                F->facets.compute_borders();
+                F->update_bbox();
+                scope.push_back(F);
+            }
+            result = union_instr(scope);
+            return result;
+            }
+        }
+        return result;
+    }
+    
     /******************************/
 
+    void CSGBuilder::do_CSG(CSGMesh_var mesh, const std::string& boolean_expr) {
+        if(mesh->vertices.dimension() == 2) {
+            triangulate(mesh, boolean_expr, true); // keep borders only
+        } else {
+            MeshSurfaceIntersection I(*mesh);
+            I.set_verbose(verbose_);
+            I.intersect();
+            I.classify(boolean_expr);
+            I.simplify_coplanar_facets();
+        }
+    }
+    
+    void CSGBuilder::triangulate(
+        CSGMesh_var mesh, const std::string& boolean_expr,
+        bool keep_borders_only
+    ) {
+        mesh->facets.clear();
+        mesh->vertices.remove_isolated();
+
+        bool has_operand_bit = Attribute<index_t>::is_defined(
+            mesh->edges.attributes(), "operand_bit"
+        );
+        Attribute<index_t> e_operand_bit(
+            mesh->edges.attributes(), "operand_bit"
+        );
+        if(!has_operand_bit) {
+            for(index_t e: mesh->edges) {
+                e_operand_bit[e] = index_t(1);
+            }
+        }
+        
+        ExactCDT2d CDT;
+        double umin = mesh->bbox().xyz_min[0];
+        double vmin = mesh->bbox().xyz_min[1];
+        double umax = mesh->bbox().xyz_max[0];
+        double vmax = mesh->bbox().xyz_max[1];
+        double d = std::max(umax-umin, vmax-vmin);
+        d *= 10.0;
+        d = std::max(d, 1.0);
+        umin-=d;
+        vmin-=d;
+        umax+=d;
+        vmax+=d;
+        CDT.create_enclosing_rectangle(umin, vmin, umax, vmax);
+
+        // In case there are duplicated vertices, keep track of indexing
+        vector<index_t> vertex_id(mesh->vertices.nb());
+        for(index_t v: mesh->vertices) {
+            vec2 p(mesh->vertices.point_ptr(v));
+            vertex_id[v] = CDT.insert(ExactCDT2d::ExactPoint(p),v);
+        }
+
+        // Memorize current number of vertices to detect vertices
+        // coming from constraint intersections
+        index_t nv0 = CDT.nv();
+
+        // Insert constraint
+        {
+            for(index_t e: mesh->edges) {
+                index_t v1 = mesh->edges.vertex(e,0);
+                index_t v2 = mesh->edges.vertex(e,1);
+                CDT.insert_constraint(
+                    vertex_id[v1], vertex_id[v2], e_operand_bit[e]
+                );
+            }
+        }
+
+        CDT.classify_triangles(boolean_expr);
+
+        // Create vertices coming from constraint intersections
+        for(index_t v=nv0; v<CDT.nv(); ++v) {
+            vec2 p = PCK::approximate(CDT.vertex_point(v));
+            CDT.set_vertex_id(
+                v,
+                mesh->vertices.create_vertex(p.data())
+            );
+        }
+
+        // Create triangles in target mesh
+        for(index_t t=0; t<CDT.nT(); ++t) {
+            mesh->facets.create_triangle(
+                CDT.vertex_id(CDT.Tv(t,0)),
+                CDT.vertex_id(CDT.Tv(t,1)),
+                CDT.vertex_id(CDT.Tv(t,2))
+            );
+        }
+
+        mesh->facets.connect();
+        mesh->facets.compute_borders();
+        if(keep_borders_only) {
+            mesh->facets.clear();
+        }
+        mesh->vertices.remove_isolated();
+
+        for(index_t e: mesh->edges) {
+            e_operand_bit[e] = 1;
+        }
+    }
+    
     void CSGBuilder::post_process(CSGMesh_var mesh) {
         geo_argused(mesh);
         // Do correct snaprounding here
     }
     
-    index_t CSGBuilder::get_fragments_from_r(double r) {
+    index_t CSGBuilder::get_fragments_from_r(double r, double twist) {
         if (fn_ > 0.0) {
             return index_t(fn_ >= 3 ? fn_ : 3);
         }
-        return index_t(ceil(fmax(fmin(360.0 / fa_, r*2*M_PI / fs_), 5)));
+        return index_t(ceil(fmax(fmin(twist / fa_, r*2*M_PI / fs_), 5)));
     }
     
     /************************************************************************/
     
-    CSGCompiler::CSGCompiler() : lex_(nullptr), progress_(nullptr) {
+    CSGCompiler::CSGCompiler() : lex_(nullptr), progress_(nullptr), lines_(0) {
         
 #define DECLARE_OBJECT(obj) object_funcs_[#obj] = &CSGCompiler::obj;
         DECLARE_OBJECT(square);
@@ -796,7 +1614,9 @@ namespace GEO {
         DECLARE_OBJECT(sphere);
         DECLARE_OBJECT(cylinder);
         DECLARE_OBJECT(polyhedron);
+        DECLARE_OBJECT(polygon);
         DECLARE_OBJECT(import);
+        DECLARE_OBJECT(surface);
         
 #define DECLARE_INSTRUCTION(instr) \
         instruction_funcs_[#instr] = &CSGCompiler::instr;
@@ -807,6 +1627,8 @@ namespace GEO {
         DECLARE_INSTRUCTION(color);
         DECLARE_INSTRUCTION(hull);
         DECLARE_INSTRUCTION(linear_extrude);
+        DECLARE_INSTRUCTION(rotate_extrude);
+        DECLARE_INSTRUCTION(projection);
         instruction_funcs_["union"]  = &CSGCompiler::union_instr;
         instruction_funcs_["render"] = &CSGCompiler::group;
     }
@@ -830,8 +1652,19 @@ namespace GEO {
                 filename_ + ": could not open file"
             );
         }
+
+        // Add the directory that contains the file to the builder's file path,
+        // so that import() instructions are able to find files in the same
+        // directory.
+        builder_.add_file_path(FileSystem::dir_name(input_filename));
+        CSGMesh_var result = compile_string(source);
+        builder_.reset_file_path();
+
+        if(!result.is_null() && result->vertices.dimension() == 2) {
+            result->vertices.set_dimension(3);
+        }
         
-        return compile_string(source);
+        return result;
     }
         
     CSGMesh_var CSGCompiler::compile_string(const std::string& source) {
@@ -848,7 +1681,8 @@ namespace GEO {
                 source.c_str()+source.length(),
                 buffer, BUFFER_SIZE
             );
-            ProgressTask progress("CSG",index_t(lines()), builder_.verbose());
+            lines_ = index_t(lines());
+            ProgressTask progress("CSG", lines_, builder_.verbose());
             progress_ = &progress;
             CSGScope scope;
             while(lookahead_token().type != CLEX_eof) {
@@ -872,6 +1706,7 @@ namespace GEO {
         delete[] buffer;
         lex_ = nullptr;
         progress_ = nullptr;
+        lines_ = 0;
         return result;
     }
 
@@ -935,10 +1770,7 @@ namespace GEO {
         const Value& points = args.get_arg("points");
         const Value& faces = args.get_arg("faces");
 
-        if(
-            points.type != Value::ARRAY2D ||
-            faces.type != Value::ARRAY2D 
-        ) {
+        if(points.type != Value::ARRAY2D || faces.type != Value::ARRAY2D) {
             syntax_error("polyhedron: wrong type (expected array)");
         }
 
@@ -959,8 +1791,13 @@ namespace GEO {
             );
             for(index_t lv=0; lv < faces.array_val[f].size(); ++lv) {
                 double v = faces.array_val[f][lv];
-                if(v < 0.0 || v > double(M->vertices.nb())) {
-                    syntax_error("polyhedron: invalid vertex index");
+                if(v < 0.0 || v >= double(M->vertices.nb())) {
+                    syntax_error(
+                        String::format(
+                            "polyhedron: invalid vertex index %d (max is %d)",
+                            int(v), int(M->vertices.nb())-1
+                        ).c_str()
+                    );
                 }
                 M->facets.set_vertex(new_f, lv, index_t(v));
             }
@@ -973,14 +1810,85 @@ namespace GEO {
         return M;
     }
 
+
+    CSGMesh_var CSGCompiler::polygon(const ArgList& args) {
+        CSGMesh_var M = new CSGMesh;
+        if(!args.has_arg("points") || !args.has_arg("paths")) {
+            syntax_error("polyhedron: missing points or paths");
+        }
+
+        const Value& points = args.get_arg("points");
+
+        if(points.type != Value::ARRAY2D) {
+            syntax_error("polyhedron: wrong points type (expected array)");
+        }
+
+        M->vertices.set_dimension(2);
+        M->vertices.create_vertices(points.array_val.size());
+        for(index_t v=0; v<points.array_val.size(); ++v) {
+            if(points.array_val[v].size() != 2) {
+                syntax_error("polyhedron: wrong vertex size (expected 2d)");
+            }
+            M->vertices.point_ptr(v)[0] = points.array_val[v][0];
+            M->vertices.point_ptr(v)[1] = points.array_val[v][1];
+        }
+        
+        const Value& paths = args.get_arg("paths");
+
+        if(paths.type == Value::ARRAY2D ) {
+            for(const auto& P : paths.array_val) {
+                for(double v: P) {
+                    if(v < 0.0 || v >= double(M->vertices.nb())) {
+                        syntax_error(
+                            String::format(
+                                "polygon: invalid vertex index %d (max is %d)",
+                                int(v), int(M->vertices.nb())-1
+                            ).c_str()
+                        );
+                    }
+                }
+                for(index_t lv1=0; lv1 < P.size(); ++lv1) {
+                    index_t lv2 = (lv1+1)%P.size();
+                    index_t v1 = index_t(P[lv1]);
+                    index_t v2 = index_t(P[lv2]);
+                    // some files do [0,1,2], some others [0,1,2,0], so we need
+                    // to test here for null edges.
+                    if(v1 != v2) {
+                        M->edges.create_edge(v1,v2);
+                    }
+                }
+            }
+        } else if(paths.type == Value::NONE) {
+            for(index_t v1=0; v1 < points.array_val.size(); ++v1) {
+                index_t v2 = (v1+1)%points.array_val.size();
+                M->edges.create_edge(v1,v2);
+            }
+        } else {
+            syntax_error("polyhedron: wrong path type (expected array or undef)");
+        }
+        
+        M->update_bbox();
+        return M;
+    }
+    
     CSGMesh_var CSGCompiler::import(const ArgList& args) {
-        std::string filename = "";
-        filename = args.get_arg("file", filename);
-        CSGMesh_var M = builder_.import(filename);
+        std::string filename  = args.get_arg("file", std::string(""));
+        std::string layer     = args.get_arg("layer", std::string(""));
+        index_t     timestamp = index_t(args.get_arg("timestamp", 0));
+        vec2        origin    = args.get_arg("origin", vec2(0.0, 0.0));
+        vec2        scale     = args.get_arg("scale", vec2(1.0, 1.0));
+        CSGMesh_var M = builder_.import(filename,layer,timestamp,origin,scale);
         if(M.is_null()) {
             syntax_error((filename + ": could not load").c_str());
         }
         return M;
+    }
+
+    CSGMesh_var CSGCompiler::surface(const ArgList& args) {
+        std::string filename  = args.get_arg("file", std::string(""));
+        bool center = args.get_arg("center", false);
+        bool invert = args.get_arg("invert", false);
+        return builder_.surface(filename, center, invert);
     }
     
     /********* Instructions **************************************************/
@@ -1033,12 +1941,28 @@ namespace GEO {
         
     CSGMesh_var CSGCompiler::linear_extrude(
         const ArgList& args, const CSGScope& scope
-    ) {
+    ) { 
         double height = args.get_arg("height", 1.0);
         bool center = args.get_arg("center", true);
-        vec2 scale(1.0, 1.0);
-        scale = args.get_arg("scale", scale);
-        return builder_.linear_extrude(scope, height, center, scale);
+        vec2 scale = args.get_arg("scale", vec2(1.0, 1.0));
+        index_t slices = index_t(args.get_arg("slices",0));
+        double twist = args.get_arg("twist",0.0);
+        return builder_.linear_extrude(scope, height, center, scale, slices, twist);
+    }
+
+    CSGMesh_var CSGCompiler::rotate_extrude(
+        const ArgList& args, const CSGScope& scope
+    ) {
+        double angle = args.get_arg("angle", 360.0);
+        return builder_.rotate_extrude(scope,angle);
+    }
+
+
+    CSGMesh_var CSGCompiler::projection(
+        const ArgList& args, const CSGScope& scope
+    ) {
+        bool cut = args.get_arg("cut", false);
+        return builder_.projection(scope,cut);
     }
     
     /********* Parser ********************************************************/
@@ -1062,14 +1986,15 @@ namespace GEO {
         }
         
         CSGMesh_var result;
-        if(is_object(lookahead.str_val)) {
+        std::string instr_or_object_name = lookahead.str_val;
+        if(is_object(instr_or_object_name)) {
             result = parse_object();
-        } else if(is_instruction(lookahead.str_val)) {
+        } else if(is_instruction(instr_or_object_name)) {
             result = parse_instruction();
         } else {
             syntax_error("id is no known object or instruction", lookahead);
         }
-        
+
         // '%': no effect on CSG tree, transparent rendering
         // '*': no effect on CSG tree
         if(modifier == '%' || modifier == '*') {
@@ -1090,6 +2015,14 @@ namespace GEO {
             }
             progress_->progress(index_t(line()));
         }
+
+        if(builder_.verbose()) {
+            index_t cur_line = index_t(line());
+            Logger::out("CSG") << "Executed " << instr_or_object_name 
+                               << " at line " << cur_line << "/" << lines_
+                               << "  (" << index_t(cur_line*100)/lines_ << "%)"
+                               << std::endl;
+        }
         
         return result;
     }
@@ -1100,6 +2033,9 @@ namespace GEO {
             syntax_error("expected object");
         }
         std::string object_name = tok.str_val;
+
+        index_t object_line = index_t(line());
+        
         ArgList args = parse_arg_list();
         next_token_check(';');
 
@@ -1109,6 +2045,11 @@ namespace GEO {
         builder_.set_fa(args.get_arg("$fa",CSGBuilder::DEFAULT_FA));
         builder_.set_fs(args.get_arg("$fs",CSGBuilder::DEFAULT_FS));
         builder_.set_fn(args.get_arg("$fn",CSGBuilder::DEFAULT_FN));
+
+        if(builder_.verbose()) {
+            Logger::out("CSG") << object_name << " at line: "
+                               << object_line << std::endl;
+        }
         
         CSGMesh_var result =  (this->*(it->second))(args);
 
@@ -1123,7 +2064,20 @@ namespace GEO {
             syntax_error("expected instruction",tok);
         }
         std::string instr_name = tok.str_val;
+
+        index_t instruction_line = index_t(line());
+        
         ArgList args = parse_arg_list();
+
+        // In .csg files produced by OpenSCAD it often happens that
+        // there are empty instructions without any context. I'm ignoring
+        // them by returning a null CSGMesh.
+        if(lookahead_token().type == ';') {
+            next_token_check(';');
+            CSGMesh_var dummy_result;
+            return dummy_result;
+        }
+        
         CSGScope scope;
         next_token_check('{');
         for(;;) {
@@ -1138,9 +2092,23 @@ namespace GEO {
         }
         next_token_check('}');
 
+        if(builder_.verbose()) {
+            Logger::out("CSG") << instr_name << " at line: "
+                               << instruction_line << std::endl;
+        }
+        
         auto it = instruction_funcs_.find(instr_name);
         geo_assert(it != instruction_funcs_.end());
-        return (this->*(it->second))(args,scope);
+
+        builder_.set_fa(args.get_arg("$fa",CSGBuilder::DEFAULT_FA));
+        builder_.set_fs(args.get_arg("$fs",CSGBuilder::DEFAULT_FS));
+        builder_.set_fn(args.get_arg("$fn",CSGBuilder::DEFAULT_FN));
+        
+        CSGMesh_var result = (this->*(it->second))(args,scope);
+
+        builder_.reset_defaults();
+
+        return result;
     }
 
     CSGCompiler::ArgList CSGCompiler::parse_arg_list() {
@@ -1198,6 +2166,10 @@ namespace GEO {
             return Value(tok.str_val);
         }
 
+        if(tok.type == CLEX_id && tok.str_val == "undef") {
+            return Value(); 
+        }
+        
         syntax_error("Expected value", tok);
     }
 
