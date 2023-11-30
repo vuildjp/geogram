@@ -27,6 +27,7 @@ cd build\Windows%buildNameSuffix%
 
 "%ProgramFiles%\cmake\bin\cmake.exe" ..\.. ^
  -DVORPALINE_PLATFORM:STRING=Win-vs-generic 
+ -DGEOGRAM_SUB_BUILD=ON
 
 
 REM -----------------------------------------------------------------
