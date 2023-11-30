@@ -26,9 +26,8 @@ if not exist "build\Windows%buildNameSuffix%" (
 cd build\Windows%buildNameSuffix%
 
 "%ProgramFiles%\cmake\bin\cmake.exe" ..\.. ^
+ -DGEOGRAM_SUB_BUILD=ON ^
  -DVORPALINE_PLATFORM:STRING=Win-vs-generic 
- -DGEOGRAM_SUB_BUILD=ON
-
 
 REM -----------------------------------------------------------------
 REM Wait for user keypress to keep DOS box open
